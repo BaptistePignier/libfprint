@@ -1,0 +1,935 @@
+// Goodix Tls driver for libfprint
+
+// Copyright (C) 2021 Alexander Meiler <alex.meiler@protonmail.com>
+// Copyright (C) 2021 Matthieu CHARETTE <matthieu.charette@gmail.com>
+// Copyright (C) 2021 Michael Teuscher <michael.teuscher@pm.me>
+
+// This library is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+
+// You should have received a copy of the GNU Lesser General Public
+// License along with this library; if not, write to the Free Software
+// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
+#include "fp-device.h"
+#include "fp-image-device.h"
+#include "fp-image.h"
+#include "fpi-assembling.h"
+#include "fpi-context.h"
+#include "fpi-image-device.h"
+#include "fpi-image.h"
+#include "fpi-ssm.h"
+#include "glibconfig.h"
+#include "gusb/gusb-device.h"
+#include <stdio.h>
+#include <stdlib.h>
+#define FP_COMPONENT "goodixtls53xd"
+
+#include <glib.h>
+#include <string.h>
+
+#include "drivers_api.h"
+#include "goodix.h"
+#include "goodix_proto.h"
+#include "goodix53xd.h"
+
+#include <math.h>
+
+#define GOODIX53XD_WIDTH 64
+#define GOODIX53XD_HEIGHT 80
+#define GOODIX53XD_SCAN_WIDTH 64
+#define GOODIX53XD_FRAME_SIZE (GOODIX53XD_WIDTH * GOODIX53XD_HEIGHT)
+// For every 4 pixels there are 6 bytes and there are 8 extra start bytes and 5
+// extra end
+#define GOODIX53XD_RAW_FRAME_SIZE                                               \
+    (GOODIX53XD_HEIGHT * GOODIX53XD_SCAN_WIDTH) / 4 * 6
+#define GOODIX53XD_CAP_FRAMES 3 // Number of frames averaged per press
+// Offset added after background subtraction so pixels stay unsigned
+#define GOODIX53XD_BG_OFFSET 0x1000
+// Finger detection polls images: the FDT thresholds are sensor specific and
+// the hardcoded ones trigger without finger on other sensors
+#define GOODIX53XD_POLL_DELAY 100 // ms between two polled frames
+#define GOODIX53XD_FINGER_NOISE_FACTOR 4
+#define GOODIX53XD_FINGER_MIN_DELTA 16 // 12 bit units
+#define GOODIX53XD_STRETCH_PERCENTILE 2
+// The outermost pixels have extreme values, they are cropped from the image
+#define GOODIX53XD_BORDER 2
+#define GOODIX53XD_IMG_WIDTH (GOODIX53XD_WIDTH - 2 * GOODIX53XD_BORDER)
+#define GOODIX53XD_IMG_HEIGHT (GOODIX53XD_HEIGHT - 2 * GOODIX53XD_BORDER)
+#define GOODIX53XD_IMG_SIZE (GOODIX53XD_IMG_WIDTH * GOODIX53XD_IMG_HEIGHT)
+
+typedef unsigned short Goodix53xdPix;
+
+typedef enum {
+    GOODIX53XD_CAPTURE_BACKGROUND,
+    GOODIX53XD_CAPTURE_WAIT_FINGER_ON,
+    GOODIX53XD_CAPTURE_PRESS,
+    GOODIX53XD_CAPTURE_WAIT_FINGER_OFF,
+} Goodix53xdCaptureMode;
+
+struct _FpiDeviceGoodixTls53XD {
+  FpiDeviceGoodixTls parent;
+
+  guint8* otp;
+
+  GSList* frames;
+
+  Goodix53xdPix empty_img[GOODIX53XD_FRAME_SIZE];
+
+  Goodix53xdCaptureMode capture_mode;
+  guint background_frames;
+  guint finger_threshold;
+
+  FpiSsm* scan_ssm;
+  gboolean polling;
+  gboolean deactivating;
+};
+
+G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd, FPI,
+                     DEVICE_GOODIXTLS53XD, FpiDeviceGoodixTls);
+
+G_DEFINE_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd,
+              FPI_TYPE_DEVICE_GOODIXTLS);
+
+// ---- ACTIVE SECTION START ----
+
+enum activate_states {
+    ACTIVATE_READ_AND_NOP,
+    ACTIVATE_ENABLE_CHIP,
+    ACTIVATE_NOP,
+    ACTIVATE_CHECK_FW_VER,
+    ACTIVATE_CHECK_PSK,
+    ACTIVATE_RESET,
+    ACTIVATE_OTP,
+    ACTIVATE_SET_MCU_IDLE,
+    ACTIVATE_SET_MCU_CONFIG,
+    ACTIVATE_NUM_STATES,
+};
+
+static void check_none(FpDevice *dev, gpointer user_data, GError *error) {
+  if (error) {
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fpi_ssm_next_state(user_data);
+}
+
+static void check_firmware_version(FpDevice *dev, gchar *firmware,
+                                   gpointer user_data, GError *error) {
+  if (error) {
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fp_dbg("Device firmware: \"%s\"", firmware);
+
+  if (strcmp(firmware, GOODIX_53XD_FIRMWARE_VERSION)) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Invalid device firmware: \"%s\"", firmware);
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fpi_ssm_next_state(user_data);
+}
+
+static void check_reset(FpDevice *dev, gboolean success, guint16 number,
+                        gpointer user_data, GError *error) {
+  if (error) {
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  if (!success) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                "Failed to reset device");
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fp_dbg("Device reset number: %d", number);
+
+  if (number != GOODIX_53XD_RESET_NUMBER) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Invalid device reset number: %d", number);
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fpi_ssm_next_state(user_data);
+}
+
+static void check_preset_psk_read(FpDevice *dev, gboolean success,
+                                  guint32 flags, guint8 *psk, guint16 length,
+                                  gpointer user_data, GError *error) {
+  g_autofree gchar *psk_str = data_to_str(psk, length);
+
+  if (error) {
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  if (!success) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                "Failed to read PSK from device");
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fp_dbg("Device PSK: 0x%s", psk_str);
+  fp_dbg("Device PSK flags: 0x%08x", flags);
+
+  if (flags != GOODIX_53XD_PSK_FLAGS) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Invalid device PSK flags: 0x%08x", flags);
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  if (length != sizeof(goodix_53xd_psk_0)) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Invalid device PSK: 0x%s", psk_str);
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  if (memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
+    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Invalid device PSK: 0x%s", psk_str);
+    fpi_ssm_mark_failed(user_data, error);
+    return;
+  }
+
+  fpi_ssm_next_state(user_data);
+}
+static void check_idle(FpDevice* dev, gpointer user_data, GError* err)
+{
+
+    if (err) {
+        fpi_ssm_mark_failed(user_data, err);
+        return;
+    }
+    fpi_ssm_next_state(user_data);
+}
+static void check_config_upload(FpDevice* dev, gboolean success,
+                                gpointer user_data, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+    }
+    else if (!success) {
+        fpi_ssm_mark_failed(user_data,
+                            g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                        "failed to upload mcu config"));
+    }
+    else {
+        fpi_ssm_next_state(user_data);
+    }
+}
+static void check_powerdown_scan_freq(FpDevice* dev, gboolean success,
+                                      gpointer user_data, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+    }
+    else if (!success) {
+        fpi_ssm_mark_failed(user_data,
+                            g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                        "failed to set powerdown freq"));
+    }
+    fpi_ssm_next_state(user_data);
+}
+
+enum otp_write_states {
+    OTP_WRITE_1,
+    OTP_WRITE_2,
+
+    OTP_WRITE_NUM,
+};
+
+static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
+{
+    /*FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case OTP_WRITE_1:
+        guint8 sensor1[] = {0x0a, 0x02};
+        goodix_send_write_sensor_register(
+        dev, 0x022c, sensor1, check_none,
+        ssm);
+        break;
+    case OTP_WRITE_2:
+        guint8 sensor2[] = {0x0a, 0x03};
+        goodix_send_write_sensor_register(
+            dev, 0x022c, sensor2, check_none,
+            ssm);
+        fpi_ssm_next_state(ssm);
+        break;
+    }*/
+}
+
+static void read_otp_callback(FpDevice* dev, guint8* data, guint16 len,
+                              gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    if (len < 64) {
+        fpi_ssm_mark_failed(ssm, g_error_new(FP_DEVICE_ERROR,
+                                             FP_DEVICE_ERROR_DATA_INVALID,
+                                             "OTP is invalid (len: %d)", 64));
+        return;
+    }
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    self->otp = malloc(64);
+    memcpy(self->otp, data, len);
+    fpi_ssm_next_state(ssm);
+}
+
+static void activate_run_state(FpiSsm* ssm, FpDevice* dev)
+{
+
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case ACTIVATE_READ_AND_NOP:
+        // Nop seems to clear the previous command buffer. But we are
+        // unable to do so.
+        goodix_start_read_loop(dev);
+        goodix_send_nop(dev, check_none, ssm);
+        break;
+
+    case ACTIVATE_ENABLE_CHIP:
+      goodix_send_enable_chip(dev, TRUE, check_none, ssm);
+      break;
+
+    case ACTIVATE_NOP:
+      goodix_send_nop(dev, check_none, ssm);
+      break;
+
+    case ACTIVATE_CHECK_FW_VER:
+      goodix_send_firmware_version(dev, check_firmware_version, ssm);
+      break;
+
+    case ACTIVATE_CHECK_PSK:
+      goodix_send_preset_psk_read(dev, GOODIX_53XD_PSK_FLAGS, 32,
+                                  check_preset_psk_read, ssm);
+      break;
+
+    case ACTIVATE_RESET:
+      goodix_send_reset(dev, TRUE, 20, check_reset, ssm);
+      break;
+
+    case ACTIVATE_OTP:
+      goodix_send_read_otp(dev, read_otp_callback, ssm);
+      break;
+
+    case ACTIVATE_SET_MCU_IDLE:
+        goodix_send_mcu_switch_to_idle_mode(dev, 20, check_idle, ssm);
+        break;
+
+    case ACTIVATE_SET_MCU_CONFIG:
+        goodix_send_upload_config_mcu(dev, goodix_53xd_config,
+                                      sizeof(goodix_53xd_config), NULL,
+                                      check_config_upload, ssm);
+        break;
+    }
+}
+
+static void tls_activation_complete(FpDevice* dev, gpointer user_data,
+                                    GError* error)
+{
+    if (error) {
+        fp_err("failed to complete tls activation: %s", error->message);
+        return;
+    }
+    FpImageDevice* image_dev = FP_IMAGE_DEVICE(dev);
+
+    fpi_image_device_activate_complete(image_dev, error);
+}
+
+static void activate_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
+{
+    G_DEBUG_HERE();
+    if (!error)
+        goodix_tls(dev, tls_activation_complete, NULL);
+    else {
+        fp_err("failed during activation: %s (code: %d)", error->message,
+               error->code);
+        fpi_image_device_activate_complete(FP_IMAGE_DEVICE(dev), error);
+    }
+}
+
+// ---- ACTIVE SECTION END ----
+
+// -----------------------------------------------------------------------------
+
+// ---- SCAN SECTION START ----
+
+enum SCAN_STAGES {
+    SCAN_STAGE_CALIBRATE,
+    SCAN_STAGE_WAIT,
+    SCAN_STAGE_SWITCH_TO_FDT_MODE,
+    SCAN_STAGE_GET_IMG,
+
+    SCAN_STAGE_NUM,
+};
+
+static void check_none_cmd(FpDevice* dev, guint8* data, guint16 len,
+                           gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    fpi_ssm_next_state(ssm);
+}
+
+// Bitdepth is 12, but we have to fit it in a byte
+static unsigned char squash(int v) { return v / 16; }
+
+static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
+                         const guint8* raw_frame)
+{
+    Goodix53xdPix uncropped[GOODIX53XD_SCAN_WIDTH * GOODIX53XD_HEIGHT];
+    Goodix53xdPix* pix = uncropped;
+    for (int i = 0; i < GOODIX53XD_RAW_FRAME_SIZE; i += 6) {
+        const guint8* chunk = raw_frame + i;
+        *pix++ = ((chunk[0] & 0xf) << 8) + chunk[1];
+        *pix++ = (chunk[3] << 4) + (chunk[0] >> 4);
+        *pix++ = ((chunk[5] & 0xf) << 8) + chunk[2];
+        *pix++ = (chunk[4] << 4) + (chunk[5] >> 4);
+    }
+
+    for (int y = 0; y != GOODIX53XD_HEIGHT; ++y) {
+        for (int x = 0; x != GOODIX53XD_WIDTH; ++x) {
+            const int idx = x + y * GOODIX53XD_SCAN_WIDTH;
+            frame[x + y * GOODIX53XD_WIDTH] = uncropped[idx];
+        }
+    }
+}
+static int goodix_cmp_short(const void* a, const void* b)
+{
+    return (int) (*(short*) a - *(short*) b);
+}
+
+static void rotate_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE])
+{
+    Goodix53xdPix buff[GOODIX53XD_FRAME_SIZE];
+
+    for (int y = 0; y != GOODIX53XD_HEIGHT; ++y) {
+        for (int x = 0; x != GOODIX53XD_WIDTH; ++x) {
+            buff[x * GOODIX53XD_WIDTH + y] = frame[x + y * GOODIX53XD_WIDTH];
+        }
+    }
+    memcpy(frame, buff, GOODIX53XD_FRAME_SIZE);
+}
+static void squash_frame(Goodix53xdPix* frame, guint8* squashed)
+{
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+        squashed[i] = squash(frame[i]);
+    }
+}
+static int goodix_cmp_int(const void* a, const void* b)
+{
+    return *(const int*) a - *(const int*) b;
+}
+
+/**
+ * @brief Squashes the 12 bit pixels of a frame into the 8 bit pixels used
+ * by libfprint, cropping GOODIX53XD_BORDER pixels on each side.
+ * @details Each row gets its mean removed, the sensor has a row dependent
+ * offset that shows as horizontal bands. The result is stretched between the
+ * GOODIX53XD_STRETCH_PERCENTILE low and high percentiles, so that a few
+ * extreme pixels don't flatten the ridges.
+ *
+ * @param frame
+ * @param squashed GOODIX53XD_IMG_SIZE pixels
+ */
+static void squash_frame_rows(Goodix53xdPix* frame, guint8* squashed)
+{
+    int values[GOODIX53XD_IMG_SIZE];
+    int sorted[GOODIX53XD_IMG_SIZE];
+
+    for (int y = 0; y != GOODIX53XD_IMG_HEIGHT; ++y) {
+        const Goodix53xdPix* row = frame +
+                                   (y + GOODIX53XD_BORDER) * GOODIX53XD_WIDTH +
+                                   GOODIX53XD_BORDER;
+        int sum = 0;
+
+        for (int x = 0; x != GOODIX53XD_IMG_WIDTH; ++x) {
+            sum += row[x];
+        }
+        for (int x = 0; x != GOODIX53XD_IMG_WIDTH; ++x) {
+            values[x + y * GOODIX53XD_IMG_WIDTH] =
+                row[x] - sum / GOODIX53XD_IMG_WIDTH;
+        }
+    }
+
+    memcpy(sorted, values, sizeof(values));
+    qsort(sorted, GOODIX53XD_IMG_SIZE, sizeof(int), goodix_cmp_int);
+    const int low =
+        sorted[GOODIX53XD_IMG_SIZE * GOODIX53XD_STRETCH_PERCENTILE / 100];
+    const int high = sorted[GOODIX53XD_IMG_SIZE *
+                            (100 - GOODIX53XD_STRETCH_PERCENTILE) / 100];
+
+    for (int i = 0; i != GOODIX53XD_IMG_SIZE; ++i) {
+        if (high == low) {
+            squashed[i] = 0;
+            continue;
+        }
+        squashed[i] = CLAMP((values[i] - low) * 0xff / (high - low), 0, 0xff);
+    }
+}
+
+/**
+ * @brief Subtracts the background from the frame
+ * @details The difference is shifted by GOODIX53XD_BG_OFFSET so it stays
+ * unsigned, squash_frame_rows() then stretches it to 8 bits.
+ *
+ * @param frame
+ * @param background
+ */
+static void postprocess_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
+                              Goodix53xdPix background[GOODIX53XD_FRAME_SIZE])
+{
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+        frame[i] = frame[i] + GOODIX53XD_BG_OFFSET - background[i];
+    }
+}
+
+/**
+ * @brief Averages the captured frames of a single press into one frame
+ *
+ * @param frames
+ * @param averaged
+ */
+static void average_frames(GSList* frames,
+                           Goodix53xdPix averaged[GOODIX53XD_FRAME_SIZE])
+{
+    guint32 sum[GOODIX53XD_FRAME_SIZE] = {0};
+    const guint count = g_slist_length(frames);
+
+    for (GSList* l = frames; l != NULL; l = l->next) {
+        const Goodix53xdPix* frame = l->data;
+        for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+            sum[i] += frame[i];
+        }
+    }
+
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+        averaged[i] = sum[i] / count;
+    }
+}
+
+/**
+ * @brief Mean absolute difference between two frames
+ *
+ * @param a
+ * @param b
+ */
+static guint frame_delta(const Goodix53xdPix a[GOODIX53XD_FRAME_SIZE],
+                         const Goodix53xdPix b[GOODIX53XD_FRAME_SIZE])
+{
+    guint64 sum = 0;
+
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+        sum += ABS((int) a[i] - (int) b[i]);
+    }
+
+    return sum / GOODIX53XD_FRAME_SIZE;
+}
+
+/**
+ * @brief Saves the image as PGM in $GOODIX53XD_DUMP_DIR, for debugging only
+ *
+ * @param img
+ */
+static void dump_image(FpImage* img)
+{
+    static guint count = 0;
+    const gchar* dir = g_getenv("GOODIX53XD_DUMP_DIR");
+
+    if (dir == NULL) {
+        return;
+    }
+
+    g_autofree gchar* path =
+        g_strdup_printf("%s/goodix53xd-%03u.pgm", dir, count++);
+    g_autofree gchar* header =
+        g_strdup_printf("P5\n%u %u\n255\n", img->width, img->height);
+    const gsize header_len = strlen(header);
+    const gsize data_len = img->width * img->height;
+    g_autofree guint8* pgm = g_malloc(header_len + data_len);
+
+    memcpy(pgm, header, header_len);
+    memcpy(pgm + header_len, img->data, data_len);
+
+    g_autoptr(GError) error = NULL;
+    if (!g_file_set_contents(path, (gchar*) pgm, header_len + data_len,
+                             &error)) {
+        fp_warn("Failed to dump image to %s: %s", path, error->message);
+        return;
+    }
+    fp_dbg("Image dumped to %s", path);
+}
+
+static void save_frame(FpiDeviceGoodixTls53XD* self, guint8* raw)
+{
+    Goodix53xdPix* frame = malloc(GOODIX53XD_FRAME_SIZE * sizeof(Goodix53xdPix));
+    decode_frame(frame, raw);
+    self->frames = g_slist_append(self->frames, frame);
+}
+
+static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
+                             gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+
+
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+    Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE];
+    guint delta;
+
+    switch (self->capture_mode) {
+    case GOODIX53XD_CAPTURE_BACKGROUND:
+        // Two frames without finger: the first one is the background
+        // subtracted from every press, their difference is the sensor noise
+        if (self->background_frames++ == 0) {
+            decode_frame(self->empty_img, data);
+            fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
+            return;
+        }
+
+        decode_frame(frame, data);
+        delta = frame_delta(frame, self->empty_img);
+        self->finger_threshold = MAX(delta * GOODIX53XD_FINGER_NOISE_FACTOR,
+                                     delta + GOODIX53XD_FINGER_MIN_DELTA);
+        fp_dbg("Background noise: %u, finger threshold: %u", delta,
+               self->finger_threshold);
+
+        self->capture_mode = GOODIX53XD_CAPTURE_WAIT_FINGER_ON;
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_WAIT);
+        return;
+
+    case GOODIX53XD_CAPTURE_WAIT_FINGER_ON:
+        decode_frame(frame, data);
+        delta = frame_delta(frame, self->empty_img);
+
+        if (delta > self->finger_threshold) {
+            fp_dbg("Finger on, delta: %u", delta);
+            // This frame may show a finger still landing, it is not kept
+            fpi_image_device_report_finger_status(img_dev, TRUE);
+            self->capture_mode = GOODIX53XD_CAPTURE_PRESS;
+            fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
+            return;
+        }
+
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_WAIT);
+        return;
+
+    case GOODIX53XD_CAPTURE_PRESS:
+        save_frame(self, data);
+        if (g_slist_length(self->frames) < GOODIX53XD_CAP_FRAMES) {
+            fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
+            return;
+        }
+
+        // The 53xd is a press sensor: the frames all cover the same area,
+        // so they are averaged instead of being assembled like a swipe
+        Goodix53xdPix averaged[GOODIX53XD_FRAME_SIZE];
+
+        average_frames(self->frames, averaged);
+        postprocess_frame(averaged, self->empty_img);
+
+        FpImage* img = fp_image_new(GOODIX53XD_IMG_WIDTH, GOODIX53XD_IMG_HEIGHT);
+        squash_frame_rows(averaged, img->data);
+
+        g_slist_free_full(self->frames, g_free);
+        self->frames = NULL;
+
+        dump_image(img);
+        fpi_image_device_image_captured(img_dev, img);
+
+        self->capture_mode = GOODIX53XD_CAPTURE_WAIT_FINGER_OFF;
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_WAIT);
+        return;
+
+    case GOODIX53XD_CAPTURE_WAIT_FINGER_OFF:
+        decode_frame(frame, data);
+        delta = frame_delta(frame, self->empty_img);
+
+        if (delta <= self->finger_threshold) {
+            fp_dbg("Finger off, delta: %u", delta);
+            // Complete first: reporting the finger off starts the next scan
+            fpi_ssm_mark_completed(ssm);
+            fpi_image_device_report_finger_status(img_dev, FALSE);
+            return;
+        }
+
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_WAIT);
+        return;
+    }
+}
+
+enum scan_empty_img_state {
+    SCAN_EMPTY_NAV0,
+    SCAN_EMPTY_GET_IMG,
+
+    SCAN_EMPTY_NUM,
+};
+
+static void on_scan_empty_img(FpDevice* dev, guint8* data, guint16 length,
+                              gpointer ssm, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(ssm, error);
+        return;
+    }
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    decode_frame(self->empty_img, data);
+    fpi_ssm_next_state(ssm);
+}
+static void scan_empty_run(FpiSsm* ssm, FpDevice* dev)
+{
+
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case SCAN_EMPTY_NAV0:
+        goodix_send_nav_0(dev, check_none_cmd, ssm);
+        break;
+
+    case SCAN_EMPTY_GET_IMG: {
+        FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+        FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
+        guint8 payload[] = {0x41, 0x03, self->otp[26], 0x00, self->otp[26] - 6, 0x00, self->otp[45], 0x00, self->otp[45] - 4, 0x00};
+        goodix_tls_read_image(dev, payload, sizeof(payload), on_scan_empty_img, ssm);
+        break;
+    }
+    }
+}
+
+static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
+{
+    fpi_ssm_start_subsm(ssm, fpi_ssm_new(dev, scan_empty_run, SCAN_EMPTY_NUM));
+}
+
+static void scan_get_img(FpDevice* dev, FpiSsm* ssm)
+{
+    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
+    guint8 payload[] = {0x41, 0x03, self->otp[26], 0x00, self->otp[26] - 6, 0x00, self->otp[45], 0x00, self->otp[45] - 4, 0x00};
+    goodix_tls_read_image(dev, payload, sizeof(payload), scan_on_read_img, ssm);
+}
+
+guint8 fdt_switch_state_mode_53xd[] = {
+    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
+    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
+    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
+    0x88, 0x88, 0x00
+};
+
+// FDT calibration values come from the OTP of each sensor
+static void set_fdt_otp(guint8* fdt, const guint8* otp)
+{
+    fdt[2] = otp[33];
+    fdt[4] = otp[41];
+    fdt[6] = otp[42];
+    fdt[8] = otp[43];
+}
+
+static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
+{
+    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
+
+
+    switch (fpi_ssm_get_cur_state(ssm)) {
+
+    case SCAN_STAGE_CALIBRATE:
+        // Capture frames without finger, using the same sequence as a
+        // finger frame (FDT mode, sensor register, image)
+        set_fdt_otp(fdt_switch_state_mode_53xd, self->otp);
+        self->capture_mode = GOODIX53XD_CAPTURE_BACKGROUND;
+        self->background_frames = 0;
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
+        break;
+
+    case SCAN_STAGE_WAIT:
+        if (self->deactivating) {
+            fpi_ssm_mark_completed(ssm);
+            break;
+        }
+        self->polling = TRUE;
+        fpi_ssm_next_state_delayed(ssm, GOODIX53XD_POLL_DELAY);
+        break;
+
+    case SCAN_STAGE_SWITCH_TO_FDT_MODE:
+        self->polling = FALSE;
+        goodix_send_mcu_switch_to_fdt_mode(dev, fdt_switch_state_mode_53xd,
+                                           sizeof(fdt_switch_state_mode_53xd), FALSE, NULL,
+                                           check_none_cmd, ssm);
+        break;
+
+    case SCAN_STAGE_GET_IMG:
+        // Register 0x022c, bytes 05 03 on the wire (little endian value)
+        goodix_send_write_sensor_register(dev, 0x022c, 0x0305, write_sensor_complete, ssm);
+        break;
+    }
+}
+
+static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+    scan_get_img(dev, user_data);
+}
+
+static void scan_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    // A new scan may already have started, only forget this one
+    if (self->scan_ssm == ssm) {
+        self->scan_ssm = NULL;
+        self->polling = FALSE;
+    }
+
+    if (error) {
+        fp_err("failed to scan: %s (code: %d)", error->message, error->code);
+        g_error_free(error);
+        return;
+    }
+    fp_dbg("finished scan");
+}
+
+static void scan_start(FpiDeviceGoodixTls53XD* dev)
+{
+    dev->deactivating = FALSE;
+    dev->scan_ssm = fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM);
+    fpi_ssm_start(dev->scan_ssm, scan_complete);
+}
+
+// ---- SCAN SECTION END ----
+
+// ---- DEV SECTION START ----
+
+static void dev_init(FpImageDevice *img_dev) {
+  FpDevice *dev = FP_DEVICE(img_dev);
+  GError *error = NULL;
+
+  if (goodix_dev_init(dev, &error)) {
+    fpi_image_device_open_complete(img_dev, error);
+    return;
+  }
+
+  fpi_image_device_open_complete(img_dev, NULL);
+}
+
+static void dev_deinit(FpImageDevice *img_dev) {
+  FpDevice *dev = FP_DEVICE(img_dev);
+  GError *error = NULL;
+
+  if (goodix_dev_deinit(dev, &error)) {
+    fpi_image_device_close_complete(img_dev, error);
+    return;
+  }
+
+  fpi_image_device_close_complete(img_dev, NULL);
+}
+
+static void dev_activate(FpImageDevice *img_dev) {
+    FpDevice* dev = FP_DEVICE(img_dev);
+
+    fpi_ssm_start(fpi_ssm_new(dev, activate_run_state, ACTIVATE_NUM_STATES),
+                  activate_complete);
+}
+
+
+
+static void dev_change_state(FpImageDevice* img_dev, FpiImageDeviceState state)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
+    G_DEBUG_HERE();
+
+    if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON) {
+        scan_start(self);
+    }
+}
+
+static void goodix53xd_reset_state(FpiDeviceGoodixTls53XD* self)
+{
+    // Drop frames of an interrupted press so they don't leak into the next one
+    g_slist_free_full(self->frames, g_free);
+    self->frames = NULL;
+}
+
+static void dev_deactivate(FpImageDevice *img_dev) {
+    FpDevice* dev = FP_DEVICE(img_dev);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
+
+    // Stop the finger polling loop: right away if it is waiting for the next
+    // poll, otherwise at its next wait
+    self->deactivating = TRUE;
+    if (self->scan_ssm != NULL && self->polling) {
+        fpi_ssm_cancel_delayed_state_change(self->scan_ssm);
+        fpi_ssm_mark_completed(self->scan_ssm);
+    }
+
+    goodix_reset_state(dev);
+    GError* error = NULL;
+    goodix_shutdown_tls(dev, &error);
+    goodix53xd_reset_state(FPI_DEVICE_GOODIXTLS53XD(img_dev));
+    fpi_image_device_deactivate_complete(img_dev, error);
+}
+
+// ---- DEV SECTION END ----
+
+static void fpi_device_goodixtls53xd_init(FpiDeviceGoodixTls53XD* self)
+{
+    self->frames = NULL;
+}
+
+static void fpi_device_goodixtls53xd_class_init(
+    FpiDeviceGoodixTls53XDClass *class) {
+  FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS(class);
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS(class);
+  FpImageDeviceClass *img_dev_class = FP_IMAGE_DEVICE_CLASS(class);
+
+  gx_class->interface = GOODIX_53XD_INTERFACE;
+  gx_class->ep_in = GOODIX_53XD_EP_IN;
+  gx_class->ep_out = GOODIX_53XD_EP_OUT;
+
+  dev_class->id = "goodixtls53xd";
+  dev_class->full_name = "Goodix TLS Fingerprint Sensor 53XD";
+  dev_class->type = FP_DEVICE_TYPE_USB;
+  dev_class->id_table = id_table;
+
+  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+
+  // NBIS finds 1 or 2 minutiae on the small 53xd images, SIGFM matches
+  // SIFT keypoints instead
+  img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+  img_dev_class->bz3_threshold = 24;
+  img_dev_class->img_width = GOODIX53XD_IMG_WIDTH;
+  img_dev_class->img_height = GOODIX53XD_IMG_HEIGHT;
+
+  img_dev_class->img_open = dev_init;
+  img_dev_class->img_close = dev_deinit;
+  img_dev_class->activate = dev_activate;
+  img_dev_class->change_state = dev_change_state;
+  img_dev_class->deactivate = dev_deactivate;
+
+  fpi_device_class_auto_initialize_features(dev_class);
+}
