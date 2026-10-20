@@ -78,6 +78,7 @@
 #define GOODIX53XD_MIN_CONTACT_DELTA 1900 // $GOODIX53XD_MIN_CONTACT overrides
 // Each image only covers a small part of the finger
 #define GOODIX53XD_ENROLL_STAGES 20
+#define GOODIX53XD_TEMPLATE_MAX 50
 #define GOODIX53XD_ACTIVATE_ATTEMPTS 3
 #define GOODIX53XD_ACTIVATE_RETRY_DELAY 200 // ms
 // Stale replies dropped when opening, see drain_input()
@@ -1255,6 +1256,9 @@ static void fpi_device_goodixtls53xd_class_init(
   // NBIS finds 1 or 2 minutiae on the small 53xd images, SIGFM matches
   // SIFT keypoints instead
   img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+  // Like the Goodix Windows engine: the template keeps up to 50 images,
+  // matching scans being added to it
+  img_dev_class->sigfm_learn_max = GOODIX53XD_TEMPLATE_MAX;
   // SIGFM score threshold. Offline, impostors never scored above 3 once the
   // fixed pattern of the sensor is removed by the calibration
   img_dev_class->bz3_threshold = 10;

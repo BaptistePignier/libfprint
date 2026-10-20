@@ -233,6 +233,24 @@ fp_image_device_maybe_complete_action (FpImageDevice *self, GError *error)
     }
 }
 
+/* Template learning, enabled by the driver with sigfm_learn_max: the matched
+ * template gets the new image, the caller saves the template if it wants to
+ * keep it. The enrolled images are never replaced. */
+static void
+fp_image_device_maybe_learn (FpImageDevice *self, FpPrint *template, FpPrint *print)
+{
+  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
+
+  if (priv->algorithm != FPI_PRINT_SIGFM || cls->sigfm_learn_max == 0)
+    return;
+
+  fpi_print_sigfm_learn (template, print,
+                         fp_device_get_nr_enroll_stages (FP_DEVICE (self)),
+                         cls->sigfm_learn_max);
+  fp_dbg ("Learned the matching image");
+}
+
 static void
 fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
@@ -331,6 +349,9 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
           else if (priv->algorithm == FPI_PRINT_SIGFM)
             result = fpi_print_sigfm_match (template, print, priv->bz3_threshold,
                                           &error);
+
+          if (result == FPI_MATCH_SUCCESS)
+            fp_image_device_maybe_learn (self, template, print);
         }
       else
         {
@@ -363,6 +384,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
 
           if (match_result == FPI_MATCH_SUCCESS)
             {
+              fp_image_device_maybe_learn (self, template, print);
               result = template;
               break;
             }

@@ -64,6 +64,37 @@ fpi_print_add_print (FpPrint *print, FpPrint *add)
 }
 
 /**
+ * fpi_print_sigfm_learn:
+ * @template: The #FPI_PRINT_SIGFM template that @print matched
+ * @print: The single image #FPI_PRINT_SIGFM print that matched
+ * @protected_count: Number of first images of @template never replaced,
+ *   the enrolled ones
+ * @max_prints: Maximum number of images of @template
+ *
+ * Adds the image of a matching scan to the template, like the template
+ * learning of the Goodix Windows engine: on small sensors, each image only
+ * covers a small part of the finger and the template keeps growing over
+ * the matches. Above @max_prints, the oldest learned image is replaced.
+ */
+void
+fpi_print_sigfm_learn (FpPrint *template, FpPrint *print,
+                       guint protected_count, guint max_prints)
+{
+  g_return_if_fail (template->type == FPI_PRINT_SIGFM);
+  g_return_if_fail (print->type == FPI_PRINT_SIGFM);
+  g_return_if_fail (print->prints->len == 1);
+
+  while (template->prints->len >= max_prints &&
+         template->prints->len > protected_count)
+    g_ptr_array_remove_index (template->prints, protected_count);
+
+  if (template->prints->len >= max_prints)
+    return;
+
+  g_ptr_array_add (template->prints, sigfm_copy_info (print->prints->pdata[0]));
+}
+
+/**
  * fpi_print_set_type:
  * @print: A #FpPrint
  * @type: The newly type of the print data

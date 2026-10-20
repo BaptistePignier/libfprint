@@ -135,6 +135,10 @@ on_match_cb (FpDevice *dev, FpPrint *match, FpPrint *print,
 
       verify_data->ret_value = EXIT_SUCCESS;
 
+      /* Drivers learning from matches add the scan to the template */
+      if (print_data_save (match, verify_data->finger, FALSE) < 0)
+        g_warning ("Failed to save the updated print");
+
       if (date && g_date_valid (date))
         g_date_strftime (date_str, G_N_ELEMENTS (date_str), "%Y-%m-%d\0",
                          fp_print_get_enroll_date (match));

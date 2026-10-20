@@ -32,6 +32,11 @@ typedef enum {
   FPI_MATCH_SUCCESS,
 } FpiMatchResult;
 
+void     fpi_print_sigfm_learn (FpPrint *template,
+                                FpPrint *print,
+                                guint    protected_count,
+                                guint    max_prints);
+
 void     fpi_print_add_print (FpPrint *print,
                               FpPrint *add);
 
