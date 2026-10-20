@@ -115,6 +115,7 @@ struct _FpImageDeviceClass
   gint                    img_height;
   FpiImageDeviceAlgorithm algorithm;
   guint                   sigfm_learn_max;
+  gint                    sigfm_min_keypoints;
 
   void                    (*img_open)     (FpImageDevice *dev);
   void                    (*img_close)    (FpImageDevice *dev);

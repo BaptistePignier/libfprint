@@ -285,6 +285,23 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
 
   action = fpi_device_get_current_action (device);
 
+  /* On small sensors, an image of regular parallel ridges has few SIFT
+   * keypoints and nothing distinctive to match: ask for another scan
+   * rather than failing the match. */
+  if (!error && action != FPI_DEVICE_ACTION_CAPTURE &&
+      priv->algorithm == FPI_PRINT_SIGFM)
+    {
+      FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
+      int keypoints = sigfm_keypoints_count (fp_image_get_sigfm_info (image));
+
+      if (keypoints < cls->sigfm_min_keypoints)
+        {
+          fp_dbg ("Only %d keypoints, asking for another scan", keypoints);
+          error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                            "Not enough details, move your finger");
+        }
+    }
+
   if (action == FPI_DEVICE_ACTION_CAPTURE)
     {
       priv->capture_image = g_steal_pointer (&image);
@@ -338,7 +355,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
   else if (action == FPI_DEVICE_ACTION_VERIFY)
     {
       FpPrint *template;
-      FpiMatchResult result;
+      FpiMatchResult result = FPI_MATCH_ERROR;
 
       fpi_device_get_verify_data (device, &template);
       if (print)
