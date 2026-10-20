@@ -49,7 +49,7 @@
 // For every 4 pixels there are 6 bytes and there are 8 extra start bytes and 5
 // extra end
 #define GOODIX53XD_RAW_FRAME_SIZE                                               \
-    (GOODIX53XD_HEIGHT * GOODIX53XD_SCAN_WIDTH) / 4 * 6
+    ((GOODIX53XD_HEIGHT * GOODIX53XD_SCAN_WIDTH) / 4 * 6)
 #define GOODIX53XD_CAP_FRAMES 3 // Number of frames averaged per press
 // Offset added after background subtraction so pixels stay unsigned: the
 // background extrapolated at the finger DAC goes above 4095
