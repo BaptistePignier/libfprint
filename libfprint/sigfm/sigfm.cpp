@@ -36,6 +36,7 @@
 #include <string>
 
 #include <opencv2/opencv.hpp>
+#include <tuple>
 #include <vector>
 
 namespace bin {
@@ -60,7 +61,9 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
 } // namespace bin
 
 namespace {
-constexpr auto distance_match = 0.75;
+// Lowe's ratio test. Ridges are periodic, so the second best match is often
+// close to the best one: 0.8 keeps more genuine matches on small sensors.
+constexpr auto distance_match = 0.8;
 constexpr auto length_match = 0.05;
 constexpr auto angle_match = 0.05;
 constexpr auto min_match = 5;
@@ -75,8 +78,10 @@ struct match {
     }
     bool operator<(const match& right) const
     {
-        return (this->p1.y < right.p1.y) ||
-               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
+        // Compare every coordinate: comparing only p1.y made the std::set
+        // keep a single match per row of the verified image
+        return std::tie(this->p1.x, this->p1.y, this->p2.x, this->p2.y) <
+               std::tie(right.p1.x, right.p1.y, right.p2.x, right.p2.y);
     }
 };
 struct angle {
