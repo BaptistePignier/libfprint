@@ -80,6 +80,10 @@
 #define GOODIX53XD_ENROLL_STAGES 20
 #define GOODIX53XD_ACTIVATE_ATTEMPTS 3
 #define GOODIX53XD_ACTIVATE_RETRY_DELAY 200 // ms
+// Stale replies dropped when opening, see drain_input()
+#define GOODIX53XD_DRAIN_MAX_READS 64
+#define GOODIX53XD_DRAIN_SIZE 0x10000
+#define GOODIX53XD_DRAIN_TIMEOUT 100 // ms
 #define GOODIX53XD_STRETCH_PERCENTILE 2
 // The outermost pixels have extreme values, they are cropped from the image
 #define GOODIX53XD_BORDER 2
@@ -1119,15 +1123,40 @@ static void scan_start(FpiDeviceGoodixTls53XD* dev)
 
 // ---- DEV SECTION START ----
 
+/**
+ * @brief Drops replies left by a previous process
+ * @details A program interrupted during a scan leaves image or TLS data in
+ * the reader, which the next activation takes for its command replies. Same
+ * as empty_buffer() in goodix-fp-dump: read until it times out.
+ *
+ * @param dev
+ */
+static void drain_input(FpDevice* dev)
+{
+    for (int i = 0; i != GOODIX53XD_DRAIN_MAX_READS; ++i) {
+        g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new(dev);
+        g_autoptr(GError) error = NULL;
+
+        fpi_usb_transfer_fill_bulk(transfer, GOODIX_53XD_EP_IN,
+                                   GOODIX53XD_DRAIN_SIZE);
+        if (!fpi_usb_transfer_submit_sync(transfer, GOODIX53XD_DRAIN_TIMEOUT,
+                                          &error)) {
+            return;
+        }
+        fp_dbg("Dropped %zd stale bytes", transfer->actual_length);
+    }
+}
+
 static void dev_init(FpImageDevice *img_dev) {
   FpDevice *dev = FP_DEVICE(img_dev);
   GError *error = NULL;
 
-  if (goodix_dev_init(dev, &error)) {
+  if (!goodix_dev_init(dev, &error)) {
     fpi_image_device_open_complete(img_dev, error);
     return;
   }
 
+  drain_input(dev);
   fpi_image_device_open_complete(img_dev, NULL);
 }
 
